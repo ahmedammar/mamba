@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated, rms_norm_ref
 
 try:
     from mamba_ssm.ops.tilelang.mamba3.mamba3_mimo import mamba3_mimo as mamba3_mimo_combined
@@ -20,8 +20,67 @@ from mamba_ssm.ops.triton.mamba3.mamba3_mimo_rotary_step import apply_rotary_qk_
 
 try:
     from mamba_ssm.ops.cute.mamba3.mamba3_step_fn import mamba3_step_fn
-except ImportError:    
+except ImportError:
     mamba3_step_fn = None
+
+
+def _apply_rotary_qk_inference_cpu(q, k, angle_state, angle_proj, dt, bias_q, bias_k, rotate_pairwise):
+    """Pure-PyTorch port of apply_rotary_qk_inference_fwd for CPU/MPS.
+
+    Mirrors the triton kernel's contract: returns (q_rot, k_rot, new_angle_state)
+    with the rotary portion rotated by the cumulative data-dependent RoPE angle
+    and any pass-through portion left untouched.
+    """
+    batch, R, nheads, d = q.shape
+    rotary_dim = angle_state.shape[-1] * 2
+
+    new_angle = (
+        angle_state.to(torch.float32)
+        + torch.tanh(angle_proj.to(torch.float32))
+        * dt.to(torch.float32)[:, :, None]
+        * math.pi
+    )
+    angle_b = new_angle.unsqueeze(1).expand(-1, R, -1, -1)
+    cos = torch.cos(angle_b)
+    sin = torch.sin(angle_b)
+
+    if bias_q is not None:
+        q = q + bias_q[None]
+    if bias_k is not None:
+        k = k + bias_k[None]
+
+    if rotate_pairwise:
+        q_rot = q[..., :rotary_dim].to(torch.float32)
+        q_pass = q[..., rotary_dim:].to(torch.float32)
+        k_rot = k[..., :rotary_dim].to(torch.float32)
+        k_pass = k[..., rotary_dim:].to(torch.float32)
+
+        q_rot = q_rot.reshape(batch, R, nheads, rotary_dim // 2, 2)
+        q0, q1 = q_rot[..., 0], q_rot[..., 1]
+        k_rot = k_rot.reshape(batch, R, nheads, rotary_dim // 2, 2)
+        k0, k1 = k_rot[..., 0], k_rot[..., 1]
+        qor = torch.stack([q0 * cos - q1 * sin, q0 * sin + q1 * cos], dim=-1).reshape(batch, R, nheads, rotary_dim)
+        kor = torch.stack([k0 * cos - k1 * sin, k0 * sin + k1 * cos], dim=-1).reshape(batch, R, nheads, rotary_dim)
+
+        if rotary_dim < d:
+            q_out = torch.cat([qor, q_pass], dim=-1)
+            k_out = torch.cat([kor, k_pass], dim=-1)
+        else:
+            q_out, k_out = qor, kor
+    else:
+        half = d // 2
+        rdim_half = rotary_dim // 2
+        if half > rdim_half:
+            pad = list(cos.shape)
+            pad[-1] = half - rdim_half
+            cos = torch.cat([cos, torch.ones(pad, device=cos.device, dtype=cos.dtype)], dim=-1)
+            sin = torch.cat([sin, torch.zeros(pad, device=sin.device, dtype=sin.dtype)], dim=-1)
+        q0, q1 = q[..., :half].to(torch.float32), q[..., half:].to(torch.float32)
+        k0, k1 = k[..., :half].to(torch.float32), k[..., half:].to(torch.float32)
+        q_out = torch.cat([q0 * cos - q1 * sin, q0 * sin + q1 * cos], dim=-1)
+        k_out = torch.cat([k0 * cos - k1 * sin, k0 * sin + k1 * cos], dim=-1)
+
+    return q_out.to(q.dtype), k_out.to(k.dtype), new_angle.to(angle_state.dtype)
 
 class Mamba3(nn.Module):
     def __init__(
@@ -289,7 +348,8 @@ class Mamba3(nn.Module):
         Also modify the state vars in-place for the next step.
 
         NOTE: Only tested on H100. Compatibility with other hardware
-        will be made available in the future.
+        will be made available in the future. Non-CUDA devices (CPU, MPS)
+        are dispatched to a pure-PyTorch reference implementation.
 
         Args:
             u: (batch, d_model)
@@ -305,6 +365,9 @@ class Mamba3(nn.Module):
             nxt_k_state: (batch, R, nheads, d_state), where R = mimo_rank (R=1 if not MIMO)
             nxt_v_state: (batch, nheads, headdim)
         """
+        if u.device.type != "cuda":
+            return self._step_cpu(u, angle_state, ssm_state, k_state, v_state)
+
         assert mamba3_step_fn is not None, "Cute Mamba-3 step function is not available. Please ensure you installed the necessary dependencies, such as nvidia-cutlass-dsl and quack-kernels."
 
         # in_proj
@@ -410,7 +473,96 @@ class Mamba3(nn.Module):
         v_state.copy_(nxt_v_state)
 
         return out, nxt_angle_state, ssm_state, nxt_k_state, nxt_v_state
-    
+
+    def _step_cpu(self, u, angle_state, ssm_state, k_state, v_state):
+        """Pure-PyTorch SISO step for CPU/MPS. Mirrors `step` semantics
+        (in-place state updates, identical return signature) without relying
+        on the CuteDSL/Triton kernels.
+
+        Only the SISO path is implemented; MIMO falls through to an explicit
+        NotImplementedError because the reference math diverges materially.
+        """
+        if self.is_mimo:
+            raise NotImplementedError("Mamba3 CPU/MPS step only supports SISO (is_mimo=False).")
+        if self.is_outproj_norm:
+            raise NotImplementedError("Mamba3 CPU/MPS step does not yet support is_outproj_norm=True.")
+
+        zxBCdt = self.in_proj(u)
+        z, x, B, C, dd_dt, dd_A, trap, angles = torch.split(
+            zxBCdt,
+            [
+                self.d_inner,
+                self.d_inner,
+                self.d_state * self.num_bc_heads * self.mimo_rank,
+                self.d_state * self.num_bc_heads * self.mimo_rank,
+                self.nheads,
+                self.nheads,
+                self.nheads,
+                self.num_rope_angles,
+            ],
+            dim=-1,
+        )
+
+        A = torch.clamp(-F.softplus(dd_A.to(torch.float32)), max=-self.A_floor)
+        DT = F.softplus(dd_dt + self.dt_bias)
+        trap = torch.sigmoid(trap)
+
+        B = rearrange(B, "b (r g s) -> b r g s", g=self.num_bc_heads, r=self.mimo_rank)
+        C = rearrange(C, "b (r g s) -> b r g s", g=self.num_bc_heads, r=self.mimo_rank)
+        B = rms_norm_ref(B, self.B_norm.weight, None, eps=self.B_norm.eps)
+        C = rms_norm_ref(C, self.C_norm.weight, None, eps=self.C_norm.eps)
+        B = B.expand(-1, -1, self.nheads, -1)
+        C = C.expand(-1, -1, self.nheads, -1)
+
+        x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+        z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+        angles = angles.unsqueeze(-2).expand(-1, self.nheads, -1)
+
+        bias_q = rearrange(self.C_bias, "h r n -> r h n")
+        bias_k = rearrange(self.B_bias, "h r n -> r h n")
+        rotate_pairwise = not self.is_mimo
+        C, B, nxt_angle_state = _apply_rotary_qk_inference_cpu(
+            q=C, k=B, angle_state=angle_state, angle_proj=angles,
+            dt=DT, bias_q=bias_q, bias_k=bias_k,
+            rotate_pairwise=rotate_pairwise,
+        )
+
+        nxt_v_state = x
+        nxt_k_state = B
+
+        B_curr = B.squeeze(1).to(torch.float32)
+        C_curr = C.squeeze(1).to(torch.float32)
+        B_prev = k_state.squeeze(1).to(torch.float32)
+        x_prev = v_state.to(torch.float32)
+        x_f = x.to(torch.float32)
+        z_f = z.to(torch.float32)
+        DT_f = DT.to(torch.float32)
+        trap_f = trap.to(torch.float32)
+
+        alpha = torch.exp(A * DT_f)
+        beta = (1.0 - trap_f) * DT_f * alpha
+        gamma = trap_f * DT_f
+
+        prev_Bx = torch.einsum("bhn, bhp -> bhpn", B_prev, x_prev)
+        curr_Bx = torch.einsum("bhn, bhp -> bhpn", B_curr, x_f)
+        new_ssm = (
+            alpha[..., None, None] * ssm_state.to(torch.float32)
+            + beta[..., None, None] * prev_Bx
+            + gamma[..., None, None] * curr_Bx
+        )
+
+        y = torch.einsum("bhpn, bhn -> bhp", new_ssm, C_curr)
+        y = y + self.D[None, :, None].to(torch.float32) * x_f
+        y = y * F.silu(z_f)
+
+        ssm_state.copy_(new_ssm.to(ssm_state.dtype))
+        angle_state.copy_(nxt_angle_state.to(angle_state.dtype))
+        k_state.copy_(nxt_k_state.to(k_state.dtype))
+        v_state.copy_(nxt_v_state.to(v_state.dtype))
+
+        out = self.out_proj(rearrange(y, "b h p -> b (h p)").to(self.in_proj.weight.dtype))
+        return out, nxt_angle_state, ssm_state, nxt_k_state, nxt_v_state
+
     def allocate_inference_cache(self, batch_size, max_seqlen, device=None, dtype=None, inplace_state=None, **kwargs):
         device = self.in_proj.weight.device if device is None else device
         dtype = self.in_proj.weight.dtype if dtype is None else dtype
