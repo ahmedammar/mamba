@@ -124,8 +124,10 @@ class Mamba3(nn.Module):
         self.mimo_rank = mimo_rank
         if not self.is_mimo:
             self.mimo_rank = 1
-        else:
-            assert mamba3_mimo_combined is not None, "Fails to import Mamba-3 MIMO kernels. Please ensure you installed the necessary dependencies, such as TileLang."
+        # NOTE: the TileLang MIMO kernel is required for `forward` (training /
+        # parallel scan) but NOT for `_step_cpu` (CPU/MPS decode). We defer the
+        # availability check to `forward` so the module can still be
+        # constructed for CPU-only inference when TileLang is missing.
 
         self.d_inner = int(self.expand * self.d_model)
         assert self.d_inner % self.headdim == 0
@@ -241,6 +243,7 @@ class Mamba3(nn.Module):
         
         # Apply Mamba-3 kernel
         if self.is_mimo:
+            assert mamba3_mimo_combined is not None, "Fails to import Mamba-3 MIMO kernels. Please ensure you installed the necessary dependencies, such as TileLang."
             y = mamba3_mimo_combined(
                 Q=C,
                 K=B,
@@ -475,15 +478,14 @@ class Mamba3(nn.Module):
         return out, nxt_angle_state, ssm_state, nxt_k_state, nxt_v_state
 
     def _step_cpu(self, u, angle_state, ssm_state, k_state, v_state):
-        """Pure-PyTorch SISO step for CPU/MPS. Mirrors `step` semantics
-        (in-place state updates, identical return signature) without relying
-        on the CuteDSL/Triton kernels.
+        """Pure-PyTorch step for CPU/MPS, supporting both SISO and MIMO.
+        Mirrors `step` semantics (in-place state updates, identical return
+        signature) without relying on the CuteDSL/Triton kernels.
 
-        Only the SISO path is implemented; MIMO falls through to an explicit
-        NotImplementedError because the reference math diverges materially.
+        The MIMO math follows `selective_state_update_fused_ref_v2` in
+        mamba3_step_fn.py (the reference used to validate the cute kernel).
+        `is_outproj_norm=True` is not supported on CPU/MPS for either path.
         """
-        if self.is_mimo:
-            raise NotImplementedError("Mamba3 CPU/MPS step only supports SISO (is_mimo=False).")
         if self.is_outproj_norm:
             raise NotImplementedError("Mamba3 CPU/MPS step does not yet support is_outproj_norm=True.")
 
@@ -530,9 +532,6 @@ class Mamba3(nn.Module):
         nxt_v_state = x
         nxt_k_state = B
 
-        B_curr = B.squeeze(1).to(torch.float32)
-        C_curr = C.squeeze(1).to(torch.float32)
-        B_prev = k_state.squeeze(1).to(torch.float32)
         x_prev = v_state.to(torch.float32)
         x_f = x.to(torch.float32)
         z_f = z.to(torch.float32)
@@ -543,17 +542,53 @@ class Mamba3(nn.Module):
         beta = (1.0 - trap_f) * DT_f * alpha
         gamma = trap_f * DT_f
 
-        prev_Bx = torch.einsum("bhn, bhp -> bhpn", B_prev, x_prev)
-        curr_Bx = torch.einsum("bhn, bhp -> bhpn", B_curr, x_f)
-        new_ssm = (
-            alpha[..., None, None] * ssm_state.to(torch.float32)
-            + beta[..., None, None] * prev_Bx
-            + gamma[..., None, None] * curr_Bx
-        )
+        if self.is_mimo:
+            B_curr = B.to(torch.float32)            # (B, R, H, S)
+            C_curr = C.to(torch.float32)            # (B, R, H, S)
+            B_prev = k_state.to(torch.float32)      # (B, R, H, S)
 
-        y = torch.einsum("bhpn, bhn -> bhp", new_ssm, C_curr)
-        y = y + self.D[None, :, None].to(torch.float32) * x_f
-        y = y * F.silu(z_f)
+            xpj = rearrange(self.mimo_x, "h r p -> r h p").to(torch.float32)
+            zpj = rearrange(self.mimo_z, "h r p -> r h p").to(torch.float32)
+            outpj = rearrange(self.mimo_o, "h r p -> r h p").to(torch.float32)
+
+            x_vals = x_f.unsqueeze(1) * xpj.unsqueeze(0)        # (B, R, H, D)
+            xs_vals = x_prev.unsqueeze(1) * xpj.unsqueeze(0)    # (B, R, H, D)
+
+            xBt_curr = torch.einsum(
+                "brhd,brhn->bhdn", x_vals * gamma[:, None, :, None], B_curr
+            )
+            xBt_prev = torch.einsum(
+                "brhd,brhn->bhdn", xs_vals * beta[:, None, :, None], B_prev
+            )
+            new_ssm = (
+                ssm_state.to(torch.float32) * alpha[:, :, None, None]
+                + xBt_curr
+                + xBt_prev
+            )
+
+            out_r = torch.einsum("bhdn,brhn->brhd", new_ssm, C_curr)
+            out_r = out_r + x_vals * self.D[None, None, :, None].to(torch.float32)
+
+            z_vals = z_f.unsqueeze(1) * zpj.unsqueeze(0)        # (B, R, H, D)
+            out_r = out_r * F.silu(z_vals)
+
+            y = torch.einsum("brhd,rhd->bhd", out_r, outpj)     # (B, H, D)
+        else:
+            B_curr = B.squeeze(1).to(torch.float32)
+            C_curr = C.squeeze(1).to(torch.float32)
+            B_prev = k_state.squeeze(1).to(torch.float32)
+
+            prev_Bx = torch.einsum("bhn, bhp -> bhpn", B_prev, x_prev)
+            curr_Bx = torch.einsum("bhn, bhp -> bhpn", B_curr, x_f)
+            new_ssm = (
+                alpha[..., None, None] * ssm_state.to(torch.float32)
+                + beta[..., None, None] * prev_Bx
+                + gamma[..., None, None] * curr_Bx
+            )
+
+            y = torch.einsum("bhpn, bhn -> bhp", new_ssm, C_curr)
+            y = y + self.D[None, :, None].to(torch.float32) * x_f
+            y = y * F.silu(z_f)
 
         ssm_state.copy_(new_ssm.to(ssm_state.dtype))
         angle_state.copy_(nxt_angle_state.to(angle_state.dtype))
