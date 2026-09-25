@@ -590,12 +590,16 @@ class Mamba3(nn.Module):
             y = y + self.D[None, :, None].to(torch.float32) * x_f
             y = y * F.silu(z_f)
 
+        out = self.out_proj(rearrange(y, "b h p -> b (h p)").to(self.in_proj.weight.dtype))
+        if torch.is_grad_enabled():
+            # Differentiable stepping (offline plasticity probe, 2026-09-12): return
+            # fresh state tensors instead of mutating the inputs in place — the
+            # in-place copies would invalidate tensors autograd saved for backward.
+            return out, nxt_angle_state, new_ssm.to(ssm_state.dtype), nxt_k_state, nxt_v_state
         ssm_state.copy_(new_ssm.to(ssm_state.dtype))
         angle_state.copy_(nxt_angle_state.to(angle_state.dtype))
         k_state.copy_(nxt_k_state.to(k_state.dtype))
         v_state.copy_(nxt_v_state.to(v_state.dtype))
-
-        out = self.out_proj(rearrange(y, "b h p -> b (h p)").to(self.in_proj.weight.dtype))
         return out, nxt_angle_state, ssm_state, nxt_k_state, nxt_v_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, device=None, dtype=None, inplace_state=None, **kwargs):
